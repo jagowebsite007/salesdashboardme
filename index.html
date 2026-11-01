@@ -1,0 +1,285 @@
+/**
+ * Sales Dashboard - backend Google Apps Script.
+ * Database = Google Sheets yang terhubung dengan script ini (container-bound).
+ *   Sheet "Transaksi"  : data penjualan (diisi lewat unggah Excel di dashboard)
+ *   Sheet "Target SKU" : target PCS per SKU per bulan (bisa diisi di dashboard ATAU langsung di sheet ini)
+ *   Sheet "Target YTD" : target PCS total setahun berjalan (YTD) per tahun
+ *   Sheet "Target Salesman" : target PCS per salesman per SKU per bulan (bisa diisi di dashboard ATAU langsung di sheet)
+ * Sheet lama "Target" (versi sebelumnya) tidak dipakai lagi dan boleh dihapus.
+ */
+var SHEET_TX = 'Transaksi';
+var SHEET_TG = 'Target SKU';
+var SHEET_YTD = 'Target YTD';
+var SHEET_TS = 'Target Salesman';
+var COLS = ['Tanggal', 'No. Nota', 'ID Customer', 'Nama Customer', 'Tipe Outlet', 'Salesman',
+            'Kota/Kabupaten', 'Nama Produk', 'Qty (CRT)', 'Qty (PCS)', 'Subtotal'];
+var TEXT_COLS = 8; // kolom 1-8 disimpan sebagai teks agar Sheets tidak mengubah format
+var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+var TG_HEADER = ['SKU', 'Tahun'].concat(MONTHS);
+var TS_HEADER = ['Salesman', 'SKU', 'Tahun'].concat(MONTHS);
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Sales Dashboard')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function sheet_(name, header) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(header);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function norm_(v) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim(); }
+function pad2_(n) { return n < 10 ? '0' + n : '' + n; }
+
+function fixCell_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return v;
+}
+
+function growTo_(sh, lastRowNeeded) {
+  if (sh.getMaxRows() < lastRowNeeded) sh.insertRowsAfter(sh.getMaxRows(), lastRowNeeded - sh.getMaxRows());
+}
+
+/** Dipanggil saat dashboard dibuka: transaksi + target SKU per bulan + target YTD. */
+function getAll() {
+  var sh = sheet_(SHEET_TX, COLS);
+  var n = sh.getLastRow() - 1;
+  var data = n > 0 ? sh.getRange(2, 1, n, COLS.length).getValues() : [];
+  data = data.map(function (row) { return row.map(fixCell_); });
+  try { // siapkan baris target untuk setiap SKU agar mudah diisi di Google Sheets
+    var skus = {}, sls = {}, yr = 0;
+    data.forEach(function (r) {
+      var s = norm_(r[7]); if (s) skus[s] = 1;
+      var sv = salesman_(r[5]); if (sv) sls[sv] = 1;
+      var y = parseInt(String(r[0]).slice(0, 4), 10); if (y > yr) yr = y;
+    });
+    if (yr) ensureTargetRows_(Object.keys(skus).sort(), yr);
+    if (yr) ensureSalesRows_(Object.keys(sls).sort(), Object.keys(skus).sort(), yr);
+  } catch (e) {}
+  return { cols: COLS, data: data, targets: targets_(), ytd: ytd_(), tsm: tsm_() };
+}
+
+/**
+ * Menyimpan data per potongan (chunk). Potongan pertama (reset = true)
+ * menghapus data lama, jadi setiap unggah Excel MENGGANTI isi sheet Transaksi.
+ */
+function saveChunk(rows, reset) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = sheet_(SHEET_TX, COLS);
+    if (reset && sh.getLastRow() > 1) {
+      sh.getRange(2, 1, sh.getLastRow() - 1, COLS.length).clearContent();
+    }
+    if (!rows || !rows.length) return 0;
+    var start = sh.getLastRow() + 1;
+    growTo_(sh, start + rows.length - 1);
+    sh.getRange(start, 1, rows.length, TEXT_COLS).setNumberFormat('@');
+    sh.getRange(start, 1, rows.length, COLS.length).setValues(rows);
+    return rows.length;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------- Target SKU per bulan ---------- */
+
+function ensureTargetRows_(skus, year) {
+  var sh = sheet_(SHEET_TG, TG_HEADER);
+  var n = sh.getLastRow() - 1, have = {};
+  if (n > 0) sh.getRange(2, 1, n, 2).getValues().forEach(function (r) { have[norm_(r[0]) + '|' + r[1]] = 1; });
+  var add = [];
+  skus.forEach(function (s) {
+    if (!have[s + '|' + year]) {
+      var row = [s, year];
+      for (var i = 0; i < 12; i++) row.push('');
+      add.push(row);
+    }
+  });
+  if (!add.length) return;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var start = sh.getLastRow() + 1;
+    growTo_(sh, start + add.length - 1);
+    sh.getRange(start, 1, add.length, 1).setNumberFormat('@');
+    sh.getRange(start, 1, add.length, TG_HEADER.length).setValues(add);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Hasil: { "NAMA SKU": { "2026-10": 100000, ... } } */
+function targets_() {
+  var sh = sheet_(SHEET_TG, TG_HEADER);
+  var n = sh.getLastRow() - 1, out = {};
+  if (n > 0) {
+    sh.getRange(2, 1, n, TG_HEADER.length).getValues().forEach(function (r) {
+      var s = norm_(r[0]), y = parseInt(r[1], 10);
+      if (!s || !y) return;
+      for (var i = 0; i < 12; i++) {
+        var v = Number(r[2 + i]);
+        if (v > 0) (out[s] = out[s] || {})[y + '-' + pad2_(i + 1)] = v;
+      }
+    });
+  }
+  return out;
+}
+
+/** Menyimpan target satu SKU untuk satu bulan (ym = 'YYYY-MM'). Nilai 0 = kosongkan. */
+function saveTarget(sku, ym, value) {
+  var year = parseInt(String(ym).slice(0, 4), 10), mi = parseInt(String(ym).slice(5), 10) - 1;
+  if (!year || mi < 0 || mi > 11) throw new Error('Bulan tidak valid: ' + ym);
+  value = Number(value) || 0;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = sheet_(SHEET_TG, TG_HEADER);
+    var n = sh.getLastRow() - 1;
+    var keys = n > 0 ? sh.getRange(2, 1, n, 2).getValues() : [];
+    var row = -1, s = norm_(sku);
+    for (var i = 0; i < keys.length; i++) {
+      if (norm_(keys[i][0]) === s && Number(keys[i][1]) === year) { row = i + 2; break; }
+    }
+    if (row < 0) {
+      if (!(value > 0)) return true;
+      row = sh.getLastRow() + 1;
+      growTo_(sh, row);
+      sh.getRange(row, 1).setNumberFormat('@');
+      sh.getRange(row, 1, 1, 2).setValues([[s, year]]);
+    }
+    sh.getRange(row, 3 + mi).setValue(value > 0 ? value : '');
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------- Target YTD ---------- */
+
+function ytd_() {
+  var sh = sheet_(SHEET_YTD, ['Tahun', 'Target YTD (PCS)']);
+  var n = sh.getLastRow() - 1, out = {};
+  if (n > 0) {
+    sh.getRange(2, 1, n, 2).getValues().forEach(function (r) {
+      if (parseInt(r[0], 10) && Number(r[1]) > 0) out[parseInt(r[0], 10)] = Number(r[1]);
+    });
+  }
+  return out;
+}
+
+function saveYtd(year, value) {
+  year = parseInt(year, 10);
+  value = Number(value) || 0;
+  if (!year) throw new Error('Tahun tidak valid');
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = sheet_(SHEET_YTD, ['Tahun', 'Target YTD (PCS)']);
+    var n = sh.getLastRow() - 1;
+    var keys = n > 0 ? sh.getRange(2, 1, n, 1).getValues() : [];
+    var row = -1;
+    for (var i = 0; i < keys.length; i++) {
+      if (parseInt(keys[i][0], 10) === year) { row = i + 2; break; }
+    }
+    if (row < 0) {
+      if (!(value > 0)) return true;
+      sh.appendRow([year, value]);
+    } else {
+      sh.getRange(row, 2).setValue(value > 0 ? value : '');
+    }
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------- Target per Salesman (Salesman x SKU x bulan) ---------- */
+
+/** Nama salesman valid = mengandung huruf (nilai angka rusak dari Excel diabaikan). */
+function salesman_(v) { return (typeof v === 'string' && /[A-Za-z]/.test(v)) ? norm_(v) : ''; }
+
+function ensureSalesRows_(sales, skus, year) {
+  var sh = sheet_(SHEET_TS, TS_HEADER);
+  var n = sh.getLastRow() - 1, have = {};
+  if (n > 0) sh.getRange(2, 1, n, 3).getValues().forEach(function (r) { have[norm_(r[0]) + '|' + norm_(r[1]) + '|' + r[2]] = 1; });
+  var add = [];
+  sales.forEach(function (sl) {
+    skus.forEach(function (sk) {
+      if (!have[sl + '|' + sk + '|' + year]) {
+        var row = [sl, sk, year];
+        for (var i = 0; i < 12; i++) row.push('');
+        add.push(row);
+      }
+    });
+  });
+  if (!add.length) return;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var start = sh.getLastRow() + 1;
+    growTo_(sh, start + add.length - 1);
+    sh.getRange(start, 1, add.length, 2).setNumberFormat('@');
+    sh.getRange(start, 1, add.length, TS_HEADER.length).setValues(add);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Hasil: { "SALESMAN": { "SKU": { "2026-10": 50000, ... } } } */
+function tsm_() {
+  var sh = sheet_(SHEET_TS, TS_HEADER);
+  var n = sh.getLastRow() - 1, out = {};
+  if (n > 0) {
+    sh.getRange(2, 1, n, TS_HEADER.length).getValues().forEach(function (r) {
+      var sl = norm_(r[0]), sk = norm_(r[1]), y = parseInt(r[2], 10);
+      if (!sl || !sk || !y) return;
+      for (var i = 0; i < 12; i++) {
+        var v = Number(r[3 + i]);
+        if (v > 0) {
+          out[sl] = out[sl] || {};
+          out[sl][sk] = out[sl][sk] || {};
+          out[sl][sk][y + '-' + pad2_(i + 1)] = v;
+        }
+      }
+    });
+  }
+  return out;
+}
+
+/** Menyimpan target satu salesman + SKU untuk satu bulan (ym = 'YYYY-MM'). Nilai 0 = kosongkan. */
+function saveTargetSales(salesman, sku, ym, value) {
+  var year = parseInt(String(ym).slice(0, 4), 10), mi = parseInt(String(ym).slice(5), 10) - 1;
+  if (!year || mi < 0 || mi > 11) throw new Error('Bulan tidak valid: ' + ym);
+  value = Number(value) || 0;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = sheet_(SHEET_TS, TS_HEADER);
+    var n = sh.getLastRow() - 1;
+    var keys = n > 0 ? sh.getRange(2, 1, n, 3).getValues() : [];
+    var row = -1, sl = norm_(salesman), sk = norm_(sku);
+    for (var i = 0; i < keys.length; i++) {
+      if (norm_(keys[i][0]) === sl && norm_(keys[i][1]) === sk && Number(keys[i][2]) === year) { row = i + 2; break; }
+    }
+    if (row < 0) {
+      if (!(value > 0)) return true;
+      row = sh.getLastRow() + 1;
+      growTo_(sh, row);
+      sh.getRange(row, 1, 1, 2).setNumberFormat('@');
+      sh.getRange(row, 1, 1, 3).setValues([[sl, sk, year]]);
+    }
+    sh.getRange(row, 4 + mi).setValue(value > 0 ? value : '');
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
