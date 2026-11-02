@@ -208,7 +208,7 @@ function load(file){
    var wb=XLSX.read(e.target.result,{type:'array'});
    var rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:null});
    if(!rows.length||!('Subtotal' in rows[0])||!('Tanggal' in rows[0])){showErr('Kolom Tanggal dan Subtotal tidak ditemukan. Pastikan baris pertama berisi nama kolom.');return}
-   var go=function(){ingest(rows);upload(rows)};
+   var go=function(){ingest(rows);upload(rows,file.name,e.target.result,file.type)};
    if(RAW.length)askReplace(file.name,rows.length,RAW.length,go);else go();
   }catch(err){showErr('File tidak bisa dibaca: '+err.message)}
  };
@@ -459,10 +459,13 @@ function askReplace(fn,nNew,nOld,go){
  mo.onclick=function(e){if(e.target===mo)close()};
  document.addEventListener('keydown',key);mo.classList.add('on');$('mNo').focus();
 }
-function upload(rows){
+function b64(buf){var u=new Uint8Array(buf),s='',i=0,n=32768;for(;i<u.length;i+=n)s+=String.fromCharCode.apply(null,u.subarray(i,i+n));return btoa(s)}
+function upload(rows,fname,buf,mime){
  var data=rows.map(function(r){return COLS.map(function(c){var v=r[c];if(c==='Tanggal')return isoDate(v);return v===null||v===undefined?'':v})}),N=1500,i=0,sy=$('sync');
  function next(){
-  if(i>=data.length){sy.textContent='Tersimpan di Google Sheets ('+data.length.toLocaleString('id-ID')+' baris)';return}
+  if(i>=data.length){var msg='Tersimpan di Google Sheets ('+data.length.toLocaleString('id-ID')+' baris)';if(!buf){sy.textContent=msg;return}
+   sy.textContent=msg+' \u00b7 mengarsipkan file ke Google Drive\u2026';
+   google.script.run.withSuccessHandler(function(r){sy.innerHTML=esc(msg)+' \u00b7 arsip file di <a href="'+esc(r.url)+'" target="_blank" rel="noopener">Google Drive</a>'}).withFailureHandler(function(er){sy.textContent=msg+' \u00b7 gagal mengarsipkan ke Drive: '+er.message}).archiveUpload(fname,b64(buf),mime||'application/octet-stream',data.length);return}
   sy.textContent='Menyimpan ke database… '+Math.round(i/data.length*100)+'%';
   google.script.run.withSuccessHandler(function(){i+=N;next()}).withFailureHandler(function(e){sy.textContent='Gagal menyimpan: '+e.message}).saveChunk(data.slice(i,i+N),i===0);
  }
@@ -476,7 +479,8 @@ function boot(){
   TGM=res.targets||{};YTDT=res.ytd||{};TSM=res.tsm||{};
   if(res.data&&res.data.length){
    ingest(res.data.map(function(row){var o={};res.cols.forEach(function(c,i){o[c]=row[i]===''?null:row[i]});return o}));
-   sy.textContent='Data dimuat dari Google Sheets ('+res.data.length.toLocaleString('id-ID')+' baris)';
+   var lm='Data dimuat dari Google Sheets ('+res.data.length.toLocaleString('id-ID')+' baris)',lu=res.lastUpload;
+   if(lu&&lu.file)sy.innerHTML=esc(lm)+' \u00b7 upload terakhir: '+esc(lu.file)+' ('+esc(lu.waktu)+')'+(lu.url?' \u00b7 <a href="'+esc(lu.url)+'" target="_blank" rel="noopener">arsip Drive</a>':'');else sy.textContent=lm;
   }else{$('meta').textContent='Database masih kosong';sy.textContent='Unggah file Excel untuk mengisi database.'}
  }).withFailureHandler(function(e){$('meta').textContent='';sy.textContent='Gagal memuat data: '+e.message}).getAll();
 }
