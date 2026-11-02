@@ -4,6 +4,8 @@
  *   Sheet "Transaksi"  : data penjualan (diisi lewat unggah Excel di dashboard)
  *   Sheet "Target SKU" : target PCS per SKU per bulan (bisa diisi di dashboard ATAU langsung di sheet ini)
  *   Sheet "Target YTD" : target PCS total setahun berjalan (YTD) per tahun
+ *   Sheet "Log Upload"   : riwayat setiap unggahan (waktu, pengguna, nama file, jumlah baris, link arsip di Google Drive)
+ *   Folder Google Drive "Sales Dashboard - Arsip Upload": salinan setiap file Excel yang diunggah
  *   Sheet "Target Salesman" : target PCS per salesman per SKU per bulan (bisa diisi di dashboard ATAU langsung di sheet)
  * Sheet lama "Target" (versi sebelumnya) tidak dipakai lagi dan boleh dihapus.
  */
@@ -11,6 +13,9 @@ var SHEET_TX = 'Transaksi';
 var SHEET_TG = 'Target SKU';
 var SHEET_YTD = 'Target YTD';
 var SHEET_TS = 'Target Salesman';
+var SHEET_LOG = 'Log Upload';
+var LOG_HEADER = ['Waktu', 'Pengguna', 'File', 'Baris', 'Link Drive'];
+var FOLDER_NAME = 'Sales Dashboard - Arsip Upload';
 var COLS = ['Tanggal', 'No. Nota', 'ID Customer', 'Nama Customer', 'Tipe Outlet', 'Salesman',
             'Kota/Kabupaten', 'Nama Produk', 'Qty (CRT)', 'Qty (PCS)', 'Subtotal'];
 var TEXT_COLS = 8; // kolom 1-8 disimpan sebagai teks agar Sheets tidak mengubah format
@@ -19,7 +24,7 @@ var TG_HEADER = ['SKU', 'Tahun'].concat(MONTHS);
 var TS_HEADER = ['Salesman', 'SKU', 'Tahun'].concat(MONTHS);
 
 function doGet() {
-  return HtmlService.createHtmlOutputFromFile('index')
+  return HtmlService.createHtmlOutputFromFile('Index')
     .setTitle('Sales Dashboard')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
@@ -64,7 +69,9 @@ function getAll() {
     if (yr) ensureTargetRows_(Object.keys(skus).sort(), yr);
     if (yr) ensureSalesRows_(Object.keys(sls).sort(), Object.keys(skus).sort(), yr);
   } catch (e) {}
-  return { cols: COLS, data: data, targets: targets_(), ytd: ytd_(), tsm: tsm_() };
+  var last = null;
+  try { last = lastUpload_(); } catch (e) {}
+  return { cols: COLS, data: data, targets: targets_(), ytd: ytd_(), tsm: tsm_(), lastUpload: last };
 }
 
 /**
@@ -282,4 +289,46 @@ function saveTargetSales(salesman, sku, ym, value) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/* ---------- Arsip file unggahan di Google Drive + log ---------- */
+
+function folder_() {
+  var it = DriveApp.getFoldersByName(FOLDER_NAME);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER_NAME);
+}
+
+/**
+ * Menyimpan salinan file Excel yang diunggah ke folder Google Drive dan mencatatnya di sheet "Log Upload".
+ * Dipanggil dashboard setelah data berhasil masuk ke sheet Transaksi.
+ */
+function archiveUpload(name, base64, mime, rowCount) {
+  var tz = Session.getScriptTimeZone(), now = new Date();
+  var safe = String(name || 'upload.xlsx').replace(/[\\\/:*?"<>|]/g, '_');
+  var stamp = Utilities.formatDate(now, tz, 'yyyy-MM-dd_HH-mm');
+  var blob = Utilities.newBlob(Utilities.base64Decode(base64), mime || 'application/octet-stream', stamp + ' - ' + safe);
+  var file = folder_().createFile(blob);
+  var url = file.getUrl();
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = sheet_(SHEET_LOG, LOG_HEADER);
+    var row = sh.getLastRow() + 1;
+    growTo_(sh, row);
+    sh.getRange(row, 1, 1, 3).setNumberFormat('@');
+    var user = '';
+    try { user = Session.getActiveUser().getEmail() || ''; } catch (e) {}
+    sh.getRange(row, 1, 1, 5).setValues([[Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss'), user, safe, Number(rowCount) || 0, url]]);
+  } finally {
+    lock.releaseLock();
+  }
+  return { url: url, name: file.getName() };
+}
+
+function lastUpload_() {
+  var sh = sheet_(SHEET_LOG, LOG_HEADER);
+  var n = sh.getLastRow();
+  if (n < 2) return null;
+  var r = sh.getRange(n, 1, 1, 5).getValues()[0];
+  return { waktu: String(r[0]), user: String(r[1]), file: String(r[2]), baris: Number(r[3]) || 0, url: String(r[4]) };
 }
