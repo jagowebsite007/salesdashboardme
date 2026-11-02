@@ -24,7 +24,7 @@ var TG_HEADER = ['SKU', 'Tahun'].concat(MONTHS);
 var TS_HEADER = ['Salesman', 'SKU', 'Tahun'].concat(MONTHS);
 
 function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
+  return HtmlService.createHtmlOutputFromFile('index')
     .setTitle('Sales Dashboard')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
